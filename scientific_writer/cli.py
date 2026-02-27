@@ -5,6 +5,7 @@ A command-line interface for scientific writing.
 """
 
 import os
+import re
 import sys
 import time
 import asyncio
@@ -86,14 +87,14 @@ async def main(track_token_usage: bool = False) -> Optional[TokenUsage]:
     cwd = Path.cwd().resolve()  # User's current working directory (absolute path)
     package_dir = Path(__file__).parent.absolute()  # Package installation directory (scientific_writer/)
     
-    # Set up Claude skills in the working directory (includes WRITER.md)
-    setup_claude_skills(package_dir, cwd)
-    
+    # Set up clean agent workspace (no .claude/skills/ to avoid hook crash, see #14)
+    agent_workspace = setup_claude_skills(package_dir, cwd)
+
     # Ensure writing_outputs folder exists in user's directory
     output_folder = ensure_output_folder(cwd)
-    
-    # Load system instructions from .claude/WRITER.md in working directory
-    system_instructions = load_system_instructions(cwd)
+
+    # Load system instructions from .claude/WRITER.md in workspace
+    system_instructions = load_system_instructions(agent_workspace)
     
     # Add conversation continuity instruction  
     # Note: The Python CLI handles session tracking via current_paper_path
@@ -121,10 +122,12 @@ IMPORTANT - CONVERSATION CONTINUITY:
     options = ClaudeAgentOptions(
         system_prompt=system_instructions,
         model="claude-opus-4-6",
-        allowed_tools=["Read", "Write", "Edit", "Bash", "WebSearch", "research-lookup"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "WebSearch"],
         permission_mode="bypassPermissions",  # Execute immediately without approval prompts
-        setting_sources=["project"],  # Load skills from project .claude directory
-        cwd=str(cwd),  # Set working directory to user's current directory
+        setting_sources=[],  # Empty: avoids skill_improvement_apply hook crash (see #14)
+        cwd=str(agent_workspace),  # Clean workspace without .claude/skills/ (see #14)
+        extra_args={"disable-slash-commands": None},  # Disable skills to prevent hook crash (see #14)
+        stderr=lambda _: None,  # Suppress non-fatal hook errors on stderr (see #14)
         max_turns=500,  # Allow many turns for long document generation
         hooks={
             "Stop": [
@@ -301,11 +304,14 @@ Based on the user request: {user_input}"""
                 # Detect the newly created directory
                 time.sleep(1)  # Brief pause to ensure filesystem is updated
                 try:
-                    paper_dirs = [d for d in output_folder.iterdir() if d.is_dir()]
+                    paper_dirs = [
+                        d for d in output_folder.iterdir()
+                        if d.is_dir() and re.match(r'^\d{8}_', d.name)
+                    ]
                     if paper_dirs:
                         most_recent = max(paper_dirs, key=lambda d: d.stat().st_mtime)
                         time_since_modification = time.time() - most_recent.stat().st_mtime
-                        
+
                         if time_since_modification < 15:  # Within last 15 seconds
                             current_paper_path = str(most_recent)
                             print(f"✓ Directory created: {most_recent.name}\n")
@@ -439,11 +445,14 @@ User request: {user_input}"""
                 # Look for the most recently modified directory in writing_outputs
                 # Only update if it was modified in the last 10 seconds (indicating it was just created)
                 try:
-                    paper_dirs = [d for d in output_folder.iterdir() if d.is_dir()]
+                    paper_dirs = [
+                        d for d in output_folder.iterdir()
+                        if d.is_dir() and re.match(r'^\d{8}_', d.name)
+                    ]
                     if paper_dirs:
                         most_recent = max(paper_dirs, key=lambda d: d.stat().st_mtime)
                         time_since_modification = time.time() - most_recent.stat().st_mtime
-                        
+
                         # Only set as current paper if it was modified very recently (within last 10 seconds)
                         if time_since_modification < 10:
                             current_paper_path = str(most_recent)

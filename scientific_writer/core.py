@@ -1,7 +1,9 @@
 """Core utilities for scientific writer."""
 
+import hashlib
 import os
 import shutil
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -11,25 +13,59 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def setup_claude_skills(package_dir: Path, work_dir: Path) -> None:
+def setup_claude_skills(package_dir: Path, work_dir: Path) -> Path:
     """
-    Set up Claude skills and WRITER.md by copying .claude/ from package to working directory.
-    
+    Set up a clean agent workspace with WRITER.md and flattened scripts.
+
+    Creates a workspace in the system temp directory, completely outside the
+    project tree. This prevents Claude Code CLI from finding .claude/skills/
+    via parent-directory traversal, which triggers the skill_improvement_apply
+    hook crash (see #14).
+
+    The workspace path is stable per work_dir (hash-based) so it persists
+    across runs and avoids redundant copies.
+
     Args:
         package_dir: Package installation directory containing .claude/
-        work_dir: User's working directory where .claude/ should be copied
+        work_dir: User's working directory
+
+    Returns:
+        Path to the agent workspace directory (use as agent cwd)
     """
     source_claude = package_dir / ".claude"
-    dest_claude = work_dir / ".claude"
-    
-    # Copy .claude directory (which includes skills/ and WRITER.md) if source exists and destination doesn't
-    if source_claude.exists() and not dest_claude.exists():
-        try:
-            shutil.copytree(source_claude, dest_claude)
-            # Note: No print statements - API should be silent, progress comes via ProgressUpdate
-        except Exception as e:
-            pass  # Silent failure - API users can check for skills availability if needed
-    # Note: No warning prints - keep API output clean
+
+    # Stable workspace path based on work_dir hash (avoids recreating each run)
+    dir_hash = hashlib.md5(str(work_dir).encode()).hexdigest()[:12]
+    workspace = Path(tempfile.gettempdir()) / f"scientific_writer_{dir_hash}"
+
+    # Create workspace structure
+    workspace.mkdir(exist_ok=True)
+    (workspace / "scripts").mkdir(exist_ok=True)
+
+    # Copy WRITER.md (always update to latest version)
+    writer_src = source_claude / "WRITER.md"
+    if writer_src.exists():
+        shutil.copy2(writer_src, workspace / "WRITER.md")
+
+    # Flatten scripts from skill directories into workspace/scripts/
+    # These are referenced by WRITER.md as "python scripts/<name>.py"
+    _SCRIPT_MAP = {
+        "skills/parallel-web/scripts/parallel_web.py": "scripts/parallel_web.py",
+        "skills/scientific-slides/scripts/pdf_to_images.py": "scripts/pdf_to_images.py",
+        "skills/scientific-schematics/scripts/generate_schematic.py": "scripts/generate_schematic.py",
+        "skills/generate-image/scripts/generate_image.py": "scripts/generate_image.py",
+    }
+    for src_rel, dst_rel in _SCRIPT_MAP.items():
+        src = source_claude / src_rel
+        if src.exists():
+            shutil.copy2(src, workspace / dst_rel)
+
+    # research_lookup.py is referenced without scripts/ prefix in WRITER.md
+    rl_src = source_claude / "skills/research-lookup/scripts/research_lookup.py"
+    if rl_src.exists():
+        shutil.copy2(rl_src, workspace / "research_lookup.py")
+
+    return workspace
 
 
 def get_api_key(api_key: Optional[str] = None) -> str:
@@ -59,16 +95,23 @@ def get_api_key(api_key: Optional[str] = None) -> str:
 
 def load_system_instructions(work_dir: Path) -> str:
     """
-    Load system instructions from .claude/WRITER.md in the working directory.
-    
+    Load system instructions from WRITER.md in the given directory.
+
+    Checks workspace root first (WRITER.md), then .claude/WRITER.md for
+    backwards compatibility.
+
     Args:
-        work_dir: Working directory containing .claude/WRITER.md.
-        
+        work_dir: Directory containing WRITER.md (workspace or working dir).
+
     Returns:
         System instructions string.
     """
-    instructions_file = work_dir / ".claude" / "WRITER.md"
-    
+    # Check workspace root first (new layout from setup_claude_skills)
+    instructions_file = work_dir / "WRITER.md"
+    if not instructions_file.exists():
+        # Fallback to .claude/ subdirectory (legacy layout)
+        instructions_file = work_dir / ".claude" / "WRITER.md"
+
     if instructions_file.exists():
         with open(instructions_file, 'r', encoding='utf-8') as f:
             return f.read()
