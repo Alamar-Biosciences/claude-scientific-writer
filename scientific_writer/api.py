@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, AsyncGenerator, Union, Literal
@@ -148,21 +149,21 @@ async def generate_paper(
     
     # Get package directory for copying skills to working directory
     package_dir = Path(__file__).parent.absolute()  # scientific_writer/ directory
-    
-    # Set up Claude skills in the working directory (includes WRITER.md)
-    setup_claude_skills(package_dir, work_dir)
-    
+
+    # Set up clean agent workspace (no .claude/skills/ to avoid hook crash, see #14)
+    agent_workspace = setup_claude_skills(package_dir, work_dir)
+
     # Ensure output folder exists in user's directory
     output_folder = ensure_output_folder(work_dir, output_dir)
-    
+
     # Initial progress update
     yield ProgressUpdate(
         message="Initializing document generation",
         stage="initialization",
     ).to_dict()
-    
-    # Load system instructions from .claude/WRITER.md in working directory
-    system_instructions = load_system_instructions(work_dir)
+
+    # Load system instructions from .claude/WRITER.md in workspace
+    system_instructions = load_system_instructions(agent_workspace)
     
     # Add conversation continuity instruction
     system_instructions += "\n\n" + f"""
@@ -201,10 +202,12 @@ IMPORTANT - CONVERSATION CONTINUITY:
     options = ClaudeAgentOptions(
         system_prompt=system_instructions,
         model=model,
-        allowed_tools=["Read", "Write", "Edit", "Bash", "WebSearch", "research-lookup"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "WebSearch"],
         permission_mode="bypassPermissions",
-        setting_sources=["project"],  # Load skills from project .claude directory
-        cwd=str(work_dir),  # User's working directory
+        setting_sources=[],  # Empty: avoids skill_improvement_apply hook crash (see #14)
+        cwd=str(agent_workspace),  # Clean workspace without .claude/skills/ (see #14)
+        extra_args={"disable-slash-commands": None},  # Disable skills to prevent hook crash (see #14)
+        stderr=lambda _: None,  # Suppress non-fatal hook errors on stderr (see #14)
         max_turns=500,  # Allow many turns for long document generation
         hooks={
             "Stop": [
@@ -596,35 +599,58 @@ def _analyze_tool_use(tool_name: str, tool_input: Dict[str, Any], current_stage:
     return None
 
 
+def _is_valid_paper_directory(d: Path) -> bool:
+    """Check if directory has the expected paper directory structure."""
+    if not d.is_dir():
+        return False
+    # Reject hidden directories
+    if d.name.startswith('.'):
+        return False
+    # Must start with YYYYMMDD_ prefix (agents may use YYYYMMDD_HHMMSS_ or just YYYYMMDD_)
+    if not re.match(r'^\d{8}_', d.name):
+        return False
+    # Must contain at least one expected subdirectory, file, or paper artifact
+    markers = ['drafts', 'final', 'references', 'figures', 'progress.md']
+    if any((d / marker).exists() for marker in markers):
+        return True
+    # Also accept if directory contains any .tex or .pdf files directly
+    return any(f.suffix in ('.tex', '.pdf') for f in d.iterdir() if f.is_file())
+
+
 def _find_most_recent_output(output_folder: Path, start_time: float) -> Optional[Path]:
     """
-    Find the most recently created/modified output directory.
-    
+    Find the most recently created output directory matching the expected naming pattern.
+
+    Uses directory name pattern for validation (YYYYMMDD_*) and filesystem
+    modification time for recency filtering (agent-chosen timestamps may not match
+    wall clock time).
+
     Args:
         output_folder: Path to output folder
         start_time: Start time of generation (to filter relevant directories)
-    
+
     Returns:
         Path to output directory or None
     """
     try:
-        output_dirs = [d for d in output_folder.iterdir() if d.is_dir()]
-        if not output_dirs:
+        # Only consider valid paper directories
+        paper_dirs = [d for d in output_folder.iterdir() if _is_valid_paper_directory(d)]
+        if not paper_dirs:
             return None
-        
-        # Filter to only directories modified after start_time
+
+        # Filter to directories modified after start_time using st_mtime
+        # (more reliable than parsing agent-chosen timestamps from names)
         recent_dirs = [
-            d for d in output_dirs 
-            if d.stat().st_mtime >= start_time - 5  # 5 second buffer
+            d for d in paper_dirs
+            if d.stat().st_mtime >= start_time - 60  # 60-second buffer
         ]
-        
+
         if not recent_dirs:
-            # Fallback to most recent directory overall
-            recent_dirs = output_dirs
-        
-        # Return the most recent
-        most_recent = max(recent_dirs, key=lambda d: d.stat().st_mtime)
-        return most_recent
+            # No directories match the time window — do NOT fall back to all dirs
+            return None
+
+        # Return the most recently modified
+        return max(recent_dirs, key=lambda d: d.stat().st_mtime)
     except Exception:
         return None
 
